@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Collaborative Document Editor - Phase 3</title>
+    <style>
+        /* Reset and base styles */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            background-color: #f5f5f5;
+        }
+
+        /* Header with status */
+        header {
+            background: #2c3e50;
+            color: white;
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        h1 {
+            font-size: 20px;
+            font-weight: 500;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            font-size: 14px;
+        }
+
+        .status-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        /* Status indicator - red when disconnected, green when connected */
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #e74c3c;
+            transition: background 0.3s;
+        }
+
+        .status-dot.connected {
+            background: #2ecc71;
+        }
+
+        /* User count styling */
+        #userCount {
+            color: #ecf0f1;
+            font-weight: 500;
+        }
+
+        /* Editor container */
+        .editor-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+            max-width: 900px;
+            width: 100%;
+            margin: 0 auto;
+        }
+
+        /* The textarea where users type */
+        #editor {
+            flex: 1;
+            padding: 20px;
+            font-size: 16px;
+            line-height: 1.6;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            resize: none;
+            outline: none;
+            background: white;
+            font-family: 'Courier New', monospace;
+        }
+
+        #editor:focus {
+            border-color: #3498db;
+            box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.1);
+        }
+
+        /* Info panel at bottom */
+        .info {
+            background: white;
+            padding: 15px 20px;
+            border-top: 1px solid #ddd;
+            font-size: 14px;
+            color: #666;
+        }
+
+        .info strong {
+            color: #333;
+        }
+    </style>
+</head>
+<body>
+    <!-- Header with title and connection status -->
+    <header>
+        <h1>Collaborative Document Editor <span id="docName" style="font-weight: normal; font-size: 0.8em;"></span></h1>
+        <div class="status">
+            <div class="status-item">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">Connecting...</span>
+            </div>
+            <div class="status-item">
+                <span id="userCount">0 users online</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main editor area -->
+    <div class="editor-container">
+        <textarea
+            id="editor"
+            placeholder="Start typing... Your changes will be visible to all connected users in real-time."
+        ></textarea>
+    </div>
+
+    <!-- Info panel -->
+    <div class="info">
+        <strong>Phase 4:</strong> Multiple document support! Each document has its own URL. Try opening different documents:
+        <a href="/doc/document1" target="_blank">/doc/document1</a>,
+        <a href="/doc/document2" target="_blank">/doc/document2</a>, or
+        <a href="/doc/my-notes" target="_blank">/doc/my-notes</a>
+    </div>
+
+    <script>
+        // Get references to DOM elements
+        const editor = document.getElementById('editor');
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const userCount = document.getElementById('userCount');
+
+        // Extract document ID from URL
+        // URL format: http://localhost:8080/doc/{documentID}
+        const pathParts = window.location.pathname.split('/');
+        const documentID = pathParts[pathParts.length - 1] || 'default';
+
+        console.log('Document ID:', documentID);
+
+        // Update page title and header with document name
+        document.title = `Collaborative Editor - ${documentID}`;
+        document.getElementById('docName').textContent = `- ${documentID}`;
+
+        // WebSocket connection
+        let ws;
+
+        // Flag to prevent feedback loops
+        // When we receive a message from the server, we update the textarea
+        // But we don't want that update to trigger sending a message back!
+        let isRemoteUpdate = false;
+
+        // Debouncing: timer to batch updates
+        // Instead of sending on every keystroke, we wait 100ms after the last keystroke
+        let debounceTimer = null;
+        const DEBOUNCE_DELAY = 100; // milliseconds
+
+        // Reconnection tracking
+        let reconnectAttempts = 0;
+        const MAX_RECONNECT_DELAY = 30000; // Max 30 seconds between attempts
+
+        // OT state tracking
+        let previousContent = '';  // Track previous content to detect changes
+        let documentVersion = 0;   // Track document version for OT
+
+        // Connect to the WebSocket server
+        function connect() {
+            // Create WebSocket connection with document ID
+            // Phase 4: ws://localhost:8080/ws/{documentID}
+            const wsURL = `ws://${window.location.host}/ws/${documentID}`;
+            console.log('Connecting to:', wsURL);
+            ws = new WebSocket(wsURL);
+
+            // Event: Connection opened
+            ws.onopen = function() {
+                console.log('WebSocket connected');
+                statusDot.classList.add('connected');
+                statusText.textContent = 'Connected';
+
+                // Reset reconnection counter on successful connection
+                reconnectAttempts = 0;
+            };
+
+            // Event: Message received from server
+            ws.onmessage = function(event) {
+                const messageData = event.data;
+                console.log('Received:', messageData);
+
+                // Try to parse as JSON (new protocol)
+                try {
+                    const message = JSON.parse(messageData);
+
+                    // Handle different message types
+                    if (message.type === 'user_count') {
+                        updateUserCount(message.user_count);
+                        return;
+                    }
+
+                    if (message.type === 'operation') {
+                        // Apply the OT operation
+                        console.log('Applying operation:', message.operation);
+                        applyOperation(message.operation);
+                        documentVersion = message.operation.version;
+                        return;
+                    }
+
+                    if (message.type === 'content') {
+                        // Full content update (fallback for backwards compatibility)
+                        isRemoteUpdate = true;
+                        editor.value = message.content;
+                        previousContent = message.content;
+                        setTimeout(() => { isRemoteUpdate = false; }, 10);
+                        return;
+                    }
+                } catch (e) {
+                    // Legacy message format (plain text or USER_COUNT:X)
+                    if (messageData.startsWith('USER_COUNT:')) {
+                        const count = parseInt(messageData.split(':')[1]);
+                        updateUserCount(count);
+                        return;
+                    }
+
+                    // Legacy full content message
+                    isRemoteUpdate = true;
+                    editor.value = messageData;
+                    previousContent = messageData;
+                    setTimeout(() => { isRemoteUpdate = false; }, 10);
+                }
+            };
+
+            // Event: Connection closed
+            ws.onclose = function() {
+                console.log('WebSocket disconnected');
+                statusDot.classList.remove('connected');
+                userCount.textContent = '0 users online';
+
+                // Calculate exponential backoff delay: 2s, 4s, 8s, 16s, up to 30s
+                reconnectAttempts++;
+                const delay = Math.min(2000 * Math.pow(2, reconnectAttempts - 1), MAX_RECONNECT_DELAY);
+
+                statusText.textContent = `Reconnecting in ${Math.ceil(delay / 1000)}s... (attempt ${reconnectAttempts})`;
+                console.log(`Reconnecting in ${delay}ms (attempt ${reconnectAttempts})`);
+
+                // Attempt to reconnect after calculated delay
+                setTimeout(connect, delay);
+            };
+
+            // Event: Error occurred
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+            };
+        }
+
+        // Update the user count display
+        function updateUserCount(count) {
+            if (count === 1) {
+                userCount.textContent = '1 user online';
+            } else {
+                userCount.textContent = `${count} users online`;
+            }
+        }
+
+        // Detect what operation(s) occurred between old and new content
+        // Returns an operation object or null if no change
+        function detectOperation(oldContent, newContent, cursorPos) {
+            if (oldContent === newContent) {
+                return null;
+            }
+
+            const oldLen = oldContent.length;
+            const newLen = newContent.length;
+
+            // Find the first position where content differs
+            let start = 0;
+            while (start < oldLen && start < newLen && oldContent[start] === newContent[start]) {
+                start++;
+            }
+
+            // Find the last position where content differs
+            let oldEnd = oldLen;
+            let newEnd = newLen;
+            while (oldEnd > start && newEnd > start &&
+                   oldContent[oldEnd - 1] === newContent[newEnd - 1]) {
+                oldEnd--;
+                newEnd--;
+            }
+
+            // Determine if this is an insert or delete
+            if (newLen > oldLen) {
+                // Insert operation
+                const insertedText = newContent.substring(start, newEnd);
+                return {
+                    type: 'insert',
+                    position: start,
+                    text: insertedText,
+                    version: documentVersion
+                };
+            } else if (newLen < oldLen) {
+                // Delete operation
+                const deletedText = oldContent.substring(start, oldEnd);
+                return {
+                    type: 'delete',
+                    position: start,
+                    text: deletedText,
+                    version: documentVersion
+                };
+            } else {
+                // Replace operation (delete + insert) - for simplicity, send as delete then insert
+                // In Phase 3A, we'll just treat this as a content update
+                return null;
+            }
+        }
+
+        // Apply an operation to the editor content
+        function applyOperation(operation) {
+            const content = editor.value;
+            let newContent;
+
+            if (operation.type === 'insert') {
+                // Insert text at position
+                newContent = content.slice(0, operation.position) +
+                           operation.text +
+                           content.slice(operation.position);
+            } else if (operation.type === 'delete') {
+                // Delete text at position
+                const deleteEnd = operation.position + operation.text.length;
+                newContent = content.slice(0, operation.position) +
+                           content.slice(deleteEnd);
+            } else {
+                console.error('Unknown operation type:', operation.type);
+                return;
+            }
+
+            // Update editor with new content
+            const cursorPos = editor.selectionStart;
+            const scrollTop = editor.scrollTop;
+
+            isRemoteUpdate = true;
+            editor.value = newContent;
+            previousContent = newContent;
+
+            // Adjust cursor position based on operation
+            let newCursorPos = cursorPos;
+            if (operation.type === 'insert') {
+                if (operation.position <= cursorPos) {
+                    newCursorPos += operation.text.length;
+                }
+            } else if (operation.type === 'delete') {
+                if (operation.position < cursorPos) {
+                    newCursorPos -= Math.min(operation.text.length, cursorPos - operation.position);
+                }
+            }
+
+            editor.setSelectionRange(newCursorPos, newCursorPos);
+            editor.scrollTop = scrollTop;
+
+            setTimeout(() => {
+                isRemoteUpdate = false;
+            }, 10);
+        }
+
+        // Listen for input events on the textarea
+        // Detect operations and send them with debouncing
+        editor.addEventListener('input', function() {
+            // Don't send if this was triggered by a remote update
+            if (isRemoteUpdate) return;
+
+            const currentContent = editor.value;
+            const cursorPos = editor.selectionStart;
+
+            // Clear any existing timer
+            if (debounceTimer) {
+                clearTimeout(debounceTimer);
+            }
+
+            // Set a new timer to send after DEBOUNCE_DELAY
+            debounceTimer = setTimeout(() => {
+                // Only send if WebSocket is connected
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    // Detect what operation occurred
+                    const operation = detectOperation(previousContent, currentContent, cursorPos);
+
+                    if (operation) {
+                        // Send the operation as JSON with document ID
+                        const message = {
+                            type: 'operation',
+                            document_id: documentID,
+                            operation: operation
+                        };
+                        console.log('Sending operation:', message);
+                        ws.send(JSON.stringify(message));
+
+                        // Update previous content
+                        previousContent = currentContent;
+                    }
+                }
+            }, DEBOUNCE_DELAY);
+        });
+
+        // Start the connection when page loads
+        connect();
+    </script>
+</body>
+</html>
